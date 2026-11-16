@@ -1,0 +1,177 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "client-aead",
+      "listen": "127.0.0.1",
+      "port": 11080,
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
+    },
+    {
+      "tag": "client-legacy-ipv6",
+      "listen": "127.0.0.1",
+      "port": 11081,
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
+    },
+    {
+      "tag": "client-dynamic",
+      "listen": "127.0.0.1",
+      "port": 11082,
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
+    },
+    {
+      "tag": "client-dynamic-ipv6",
+      "listen": "127.0.0.1",
+      "port": 11083,
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "vmess-aead",
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 21001,
+            "users": [
+              {
+                "id": "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082",
+                "alterId": 0,
+                "security": "auto"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/v4"
+        }
+      }
+    },
+    {
+      "tag": "vmess-legacy-ipv6",
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "::1",
+            "port": 21002,
+            "users": [
+              {
+                "id": "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082",
+                "alterId": 32,
+                "security": "auto"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/v6"
+        }
+      }
+    },
+    {
+      "tag": "vmess-dynamic",
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 21003,
+            "users": [
+              {
+                "id": "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082",
+                "alterId": 0,
+                "security": "auto"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/dynamic"
+        }
+      }
+    },
+    {
+      "tag": "vmess-dynamic-ipv6",
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "::1",
+            "port": 21004,
+            "users": [
+              {
+                "id": "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082",
+                "alterId": 0,
+                "security": "auto"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/dynamic-v6"
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "client-aead"
+        ],
+        "outboundTag": "vmess-aead"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "client-legacy-ipv6"
+        ],
+        "outboundTag": "vmess-legacy-ipv6"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "client-dynamic"
+        ],
+        "outboundTag": "vmess-dynamic"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "client-dynamic-ipv6"
+        ],
+        "outboundTag": "vmess-dynamic-ipv6"
+      }
+    ]
+  }
+}

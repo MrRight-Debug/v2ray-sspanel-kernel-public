@@ -1,0 +1,59 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "vmess-ipv4-legacy-server",
+      "listen": "127.0.0.1",
+      "port": 21001,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082",
+            "alterId": 32,
+            "level": 0
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/v4"
+        }
+      }
+    },
+    {
+      "tag": "vmess-ipv6-legacy-server",
+      "listen": "::1",
+      "port": 21002,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082",
+            "alterId": 32,
+            "level": 0
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/v6"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "blocked",
+      "protocol": "blackhole"
+    }
+  ]
+}

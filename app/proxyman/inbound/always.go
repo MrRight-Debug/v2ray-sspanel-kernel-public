@@ -46,6 +46,11 @@ type AlwaysOnInboundHandler struct {
 	workers []worker
 	mux     *mux.Server
 	tag     string
+	ctx     context.Context
+}
+
+type sspanelStarter interface {
+	StartSSPanel(context.Context, string) error
 }
 
 func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *proxyman.ReceiverConfig, proxyConfig interface{}) (*AlwaysOnInboundHandler, error) {
@@ -62,6 +67,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 		proxy: p,
 		mux:   mux.NewServer(ctx),
 		tag:   tag,
+		ctx:   ctx,
 	}
 
 	uplinkCounter, downlinkCounter := getStatCounter(core.MustFromContext(ctx), tag)
@@ -151,6 +157,11 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 func (h *AlwaysOnInboundHandler) Start() error {
 	for _, worker := range h.workers {
 		if err := worker.Start(); err != nil {
+			return err
+		}
+	}
+	if starter, ok := h.proxy.(sspanelStarter); ok {
+		if err := starter.StartSSPanel(h.ctx, h.tag); err != nil {
 			return err
 		}
 	}
