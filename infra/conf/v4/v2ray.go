@@ -24,6 +24,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/infra/conf/synthetic/log"
 	"github.com/v2fly/v2ray-core/v5/infra/conf/synthetic/router"
 	"github.com/v2fly/v2ray-core/v5/infra/conf/v5cfg"
+	vmessInbound "github.com/v2fly/v2ray-core/v5/proxy/vmess/inbound"
 )
 
 var (
@@ -199,6 +200,11 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 	ts, err := rawConfig.(cfgcommon.Buildable).Build()
 	if err != nil {
 		return nil, err
+	}
+	if strings.EqualFold(c.Protocol, "vmess") {
+		if err := vmessInbound.RegisterSSPanelConfig(c.Tag, settings); err != nil {
+			return nil, err
+		}
 	}
 
 	return &core.InboundHandlerConfig{

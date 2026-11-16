@@ -109,6 +109,8 @@ type Handler struct {
 	detours               *DetourConfig
 	sessionHistory        *encoding.SessionHistory
 	secure                bool
+	sspanelMu             sync.Mutex
+	sspanel               *sspanelSync
 }
 
 // New creates a new VMess inbound handler.
@@ -140,10 +142,44 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
+	h.sspanelMu.Lock()
+	sspanel := h.sspanel
+	h.sspanel = nil
+	h.sspanelMu.Unlock()
+	if sspanel != nil {
+		sspanel.close()
+	}
 	return errors.Combine(
 		h.clients.Close(),
 		h.sessionHistory.Close(),
 		common.Close(h.usersByEmail))
+}
+
+// StartSSPanel starts native SSPanel user synchronization for this inbound tag.
+// It is called by the inbound manager after the listener starts.
+func (h *Handler) StartSSPanel(ctx context.Context, tag string) error {
+	config := getSSPanelConfig(tag)
+	if config == nil {
+		return nil
+	}
+
+	sync := newSSPanelSync(h, config)
+	h.sspanelMu.Lock()
+	if h.sspanel != nil {
+		h.sspanelMu.Unlock()
+		return newError("sspanel sync already started for inbound ", tag)
+	}
+	h.sspanel = sync
+	h.sspanelMu.Unlock()
+
+	sync.start(ctx)
+	return nil
+}
+
+func (h *Handler) currentSSPanel() *sspanelSync {
+	h.sspanelMu.Lock()
+	defer h.sspanelMu.Unlock()
+	return h.sspanel
 }
 
 // Network implements proxy.Inbound.Network().
@@ -221,6 +257,9 @@ func isInsecureEncryption(s protocol.SecurityType) bool {
 
 // Process implements proxy.Inbound.Process().
 func (h *Handler) Process(ctx context.Context, network net.Network, connection internet.Connection, dispatcher routing.Dispatcher) error {
+	meteredConnection := &sspanelMeteredConnection{Connection: connection}
+	connection = meteredConnection
+
 	sessionPolicy := h.policyManager.ForLevel(0)
 	if err := connection.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
 		return newError("unable to set read deadline").Base(err).AtWarning()
@@ -275,6 +314,21 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 		panic("no inbound metadata")
 	}
 	inbound.User = request.User
+
+	if sspanel := h.currentSSPanel(); sspanel != nil {
+		if !sspanel.acquireConnection() {
+			return newError("sspanel connection limit reached for inbound ", inbound.Tag).AtWarning()
+		}
+		defer sspanel.releaseConnection()
+
+		user := sspanel.getUser(request.User.Email)
+		ip := remoteIP(connection.RemoteAddr())
+		if user != nil {
+			meteredConnection.user = user
+			user.enterIP(ip)
+			defer user.leaveIP(ip)
+		}
+	}
 
 	sessionPolicy = h.policyManager.ForLevel(request.User.Level)
 
