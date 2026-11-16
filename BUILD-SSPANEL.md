@@ -17,16 +17,18 @@ small `main/slim` entry point for the current VMess/WebSocket deployment.
 
 ## Build
 
+The baseline is V2Fly v5.56.0, built with Go 1.27.4:
+
 ```bash
 bash build/build-v2ray-sspanel.sh
 ```
 
-The build uses Go 1.26.1 and produces a statically linked Linux amd64 binary.
+The build produces a statically linked Linux amd64 binary in
+`/opt/v2ray-sspanel-build/v5.56.0/artifacts`.
 
 ## Protocol scope
 
 The runtime entry point only registers the modules required by the current
 deployment. The upstream v4 JSON parser still links protocol configuration
 packages, so removing unused protocol entries from runtime configuration does
-not yet produce a fully protocol-minimal binary. Eliminating those linked
-packages requires a separate selective JSON parser refactor.
+not yet produce a fully protocol-minimal binary.
