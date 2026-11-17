@@ -1,0 +1,23 @@
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {"tag": "socks-1", "listen": "127.0.0.1", "port": 26001, "protocol": "socks", "settings": {"udp": false}},
+    {"tag": "socks-2", "listen": "127.0.0.1", "port": 26002, "protocol": "socks", "settings": {"udp": false}},
+    {"tag": "socks-3", "listen": "127.0.0.1", "port": 26003, "protocol": "socks", "settings": {"udp": false}},
+    {"tag": "socks-4", "listen": "127.0.0.1", "port": 26004, "protocol": "socks", "settings": {"udp": false}}
+  ],
+  "outbounds": [
+    {"tag": "node-101", "protocol": "vmess", "settings": {"vnext": [{"address": "127.0.0.1", "port": 24001, "users": [{"id": "00000000-0000-0000-0000-000000000001", "alterId": 0, "security": "auto"}]}]}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/n1"}}},
+    {"tag": "node-102", "protocol": "vmess", "settings": {"vnext": [{"address": "127.0.0.1", "port": 24002, "users": [{"id": "00000000-0000-0000-0000-000000000001", "alterId": 0, "security": "auto"}]}]}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/n2"}}},
+    {"tag": "node-103", "protocol": "vmess", "settings": {"vnext": [{"address": "127.0.0.1", "port": 24003, "users": [{"id": "00000000-0000-0000-0000-000000000001", "alterId": 0, "security": "auto"}]}]}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/n3"}}},
+    {"tag": "node-104", "protocol": "vmess", "settings": {"vnext": [{"address": "127.0.0.1", "port": 24004, "users": [{"id": "00000000-0000-0000-0000-000000000001", "alterId": 0, "security": "auto"}]}]}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/n4"}}}
+  ],
+  "routing": {
+    "rules": [
+      {"type": "field", "inboundTag": ["socks-1"], "outboundTag": "node-101"},
+      {"type": "field", "inboundTag": ["socks-2"], "outboundTag": "node-102"},
+      {"type": "field", "inboundTag": ["socks-3"], "outboundTag": "node-103"},
+      {"type": "field", "inboundTag": ["socks-4"], "outboundTag": "node-104"}
+    ]
+  }
+}

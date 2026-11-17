@@ -28,6 +28,9 @@ func TestRegisterSSPanelConfig(t *testing.T) {
 	if config.Key != "test-key" || config.NodeID != 11 || config.Refresh != 45 || config.ConnLimit != 800 {
 		t.Fatalf("unexpected config: %+v", config)
 	}
+	if config.ShareGroup != "default" {
+		t.Fatalf("unexpected share group: %s", config.ShareGroup)
+	}
 }
 
 func TestRegisterSSPanelConfigUsesEnvironment(t *testing.T) {
@@ -59,6 +62,24 @@ func TestRegisterSSPanelConfigRejectsInvalidURL(t *testing.T) {
 	}`)
 	if err := RegisterSSPanelConfig("invalid", settings); err == nil {
 		t.Fatal("expected invalid URL to fail")
+	}
+}
+
+func TestRegisterSSPanelConfigShareGroup(t *testing.T) {
+	settings := []byte(`{
+		"sspanel": {
+			"url": "https://panel.example.test",
+			"key": "test-key",
+			"node_id": 31,
+			"share_group": "scope-a"
+		}
+	}`)
+	if err := RegisterSSPanelConfig("scope-a", settings); err != nil {
+		t.Fatal(err)
+	}
+	config := getSSPanelConfig("scope-a")
+	if config == nil || config.ShareGroup != "scope-a" {
+		t.Fatalf("unexpected share group: %+v", config)
 	}
 }
 

@@ -14,11 +14,12 @@ import (
 // by the VMess inbound. It is intentionally separate from the protobuf config so
 // existing v4 JSON configurations remain compatible.
 type SSPanelConfig struct {
-	URL       string `json:"url"`
-	Key       string `json:"key"`
-	NodeID    int64  `json:"node_id"`
-	Refresh   int    `json:"refresh"`
-	ConnLimit int64  `json:"conn_limit"`
+	URL        string `json:"url"`
+	Key        string `json:"key"`
+	NodeID     int64  `json:"node_id"`
+	Refresh    int    `json:"refresh"`
+	ConnLimit  int64  `json:"conn_limit"`
+	ShareGroup string `json:"share_group"`
 }
 
 func decodeFlexibleInt64(raw json.RawMessage) (int64, error) {
@@ -42,6 +43,7 @@ func (c *SSPanelConfig) UnmarshalJSON(data []byte) error {
 		NodeID    json.RawMessage `json:"node_id"`
 		Refresh   json.RawMessage `json:"refresh"`
 		ConnLimit json.RawMessage `json:"conn_limit"`
+		ShareGroup string         `json:"share_group"`
 	}{}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -63,6 +65,7 @@ func (c *SSPanelConfig) UnmarshalJSON(data []byte) error {
 	c.NodeID = nodeID
 	c.Refresh = int(refresh)
 	c.ConnLimit = connLimit
+	c.ShareGroup = raw.ShareGroup
 	return nil
 }
 
@@ -116,6 +119,12 @@ func (c *SSPanelConfig) normalize() error {
 	}
 	if c.ConnLimit == 0 {
 		c.ConnLimit = envInt64("V2RAY_SSPANEL_CONN_LIMIT", 800)
+	}
+	if c.ShareGroup == "" {
+		c.ShareGroup = strings.TrimSpace(os.Getenv("V2RAY_SSPANEL_SHARE_GROUP"))
+	}
+	if c.ShareGroup == "" {
+		c.ShareGroup = "default"
 	}
 
 	c.URL = strings.TrimRight(strings.TrimSpace(c.URL), "/")

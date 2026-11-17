@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 go_root=${GO_ROOT:-/opt/codex-toolchains/go1.27.4/go}
-artifact_dir=${ARTIFACT_DIR:-/opt/v2ray-sspanel-build/v5.56.0/artifacts}
+artifact_dir=${ARTIFACT_DIR:-/opt/v2ray-sspanel-build/v5.56.0-shared/artifacts}
 
 export PATH="$go_root/bin:$PATH"
 export GOTOOLCHAIN=local
@@ -25,13 +25,29 @@ GOARCH=amd64 \
 GOAMD64=v1 \
 go build \
   -trimpath \
-  -ldflags="-s -w -buildid= -X github.com/v2fly/v2ray-core/v5.build=SSPanel-Go1.27.4-static" \
-  -o "$artifact_dir/v2ray-sspanel" \
+  -ldflags="-s -w -buildid= -X github.com/v2fly/v2ray-core/v5.build=SSPanel-shared-Go1.27.4-static" \
+  -o "$artifact_dir/v2ray-sspanel-shared" \
   ./main/slim
 
-"$artifact_dir/v2ray-sspanel" version
-"$artifact_dir/v2ray-sspanel" test -config testdata/acceptance/static-server.json
-"$artifact_dir/v2ray-sspanel" test -config testdata/acceptance/sspanel-server.json
-"$artifact_dir/v2ray-sspanel" test -config testdata/acceptance/sspanel-server-ipv6.json
+CGO_ENABLED=0 \
+GOOS=linux \
+GOARCH=amd64 \
+GOAMD64=v1 \
+go build \
+  -tags pprof \
+  -trimpath \
+  -ldflags="-s -w -buildid= -X github.com/v2fly/v2ray-core/v5.build=SSPanel-shared-profile-Go1.27.4" \
+  -o "$artifact_dir/v2ray-sspanel-shared-pprof" \
+  ./main/slim
 
-sha256sum "$artifact_dir/v2ray-sspanel" | tee "$artifact_dir/v2ray-sspanel.sha256"
+"$artifact_dir/v2ray-sspanel-shared" version
+"$artifact_dir/v2ray-sspanel-shared" test -config testdata/acceptance/static-server.json
+"$artifact_dir/v2ray-sspanel-shared" test -config testdata/acceptance/sspanel-server.json
+"$artifact_dir/v2ray-sspanel-shared" test -config testdata/acceptance/sspanel-server-ipv6.json
+"$artifact_dir/v2ray-sspanel-shared" test -config testdata/acceptance/shared-server-1.json
+"$artifact_dir/v2ray-sspanel-shared" test -config testdata/acceptance/shared-server-4.json
+
+sha256sum \
+  "$artifact_dir/v2ray-sspanel-shared" \
+  "$artifact_dir/v2ray-sspanel-shared-pprof" \
+  | tee "$artifact_dir/v2ray-sspanel-shared.sha256"

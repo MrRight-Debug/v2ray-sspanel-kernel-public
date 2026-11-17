@@ -55,14 +55,18 @@ func TestSSPanelSyncUsersTrafficAndIPs(t *testing.T) {
 		usersByEmail: newUserByEmail(&DefaultConfig{AlterId: 32}),
 	}
 	sync := newSSPanelSync(handler, &SSPanelConfig{
-		URL:       panel.URL,
-		Key:       "test-key",
-		NodeID:    21,
-		Refresh:   60,
-		ConnLimit: 800,
+		URL:        panel.URL,
+		Key:        "test-key",
+		NodeID:     21,
+		Refresh:    60,
+		ConnLimit:  800,
+		ShareGroup: "single-test",
 	})
 
 	ctx := context.Background()
+	sync.manager.acquire(ctx, 21, 60)
+	defer sync.manager.release(21)
+	sync.manager.waitReady(ctx)
 	if err := sync.refreshNodeInfo(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -76,13 +80,10 @@ func TestSSPanelSyncUsersTrafficAndIPs(t *testing.T) {
 	if user == nil {
 		t.Fatal("expected synchronized user")
 	}
-	if user.uuid != testUUID || user.alterID != 32 {
+	if user.shared.UUID != testUUID || user.alterID != 32 {
 		t.Fatalf("unexpected user: %+v", user)
 	}
-	memoryUser, err := user.memoryUser()
-	if err != nil {
-		t.Fatal(err)
-	}
+	memoryUser := user.memoryUser()
 	account := memoryUser.Account.(*vmess.MemoryAccount)
 	if len(account.AlterIDs) != 32 {
 		t.Fatalf("unexpected alter ID count: %d", len(account.AlterIDs))
@@ -120,7 +121,13 @@ func TestSSPanelSyncUsersTrafficAndIPs(t *testing.T) {
 
 func TestSSPanelConnectionLimit(t *testing.T) {
 	handler := &Handler{}
-	sync := newSSPanelSync(handler, &SSPanelConfig{ConnLimit: 2})
+	sync := newSSPanelSync(handler, &SSPanelConfig{
+		URL:        "http://127.0.0.1:1",
+		Key:        "test-key",
+		NodeID:     1,
+		ShareGroup: "connection-limit-test",
+		ConnLimit:  2,
+	})
 	if !sync.acquireConnection() || !sync.acquireConnection() {
 		t.Fatal("expected first two connections to succeed")
 	}

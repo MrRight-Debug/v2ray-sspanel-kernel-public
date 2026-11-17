@@ -14,6 +14,17 @@ small `main/slim` entry point for the current VMess/WebSocket deployment.
 - Accepts numeric or string values for SSPanel `node_id`, `refresh` and
   `conn_limit`.
 - Enforces the configured per-inbound connection limit.
+- Shares one HTTP/TLS client pool and one `/users` polling manager for inbounds
+  with the same panel URL, authentication key and `share_group`.
+- Uses ETag, Last-Modified and semantic response hashing to avoid rebuilding
+  unchanged user snapshots.
+- Publishes immutable snapshots atomically. Each inbound still owns its node
+  info polling, projection, VMess validator, connection and reporting state.
+- Retains the last valid snapshot across panel failures with exponential
+  retry backoff.
+
+`share_group` defaults to `default`. Configure a different value when nodes
+have different panel user eligibility scopes.
 
 ## Build
 
@@ -23,8 +34,14 @@ The baseline is V2Fly v5.56.0, built with Go 1.27.4:
 bash build/build-v2ray-sspanel.sh
 ```
 
-The build produces a statically linked Linux amd64 binary in
-`/opt/v2ray-sspanel-build/v5.56.0/artifacts`.
+The build produces statically linked Linux amd64 binaries in
+`/opt/v2ray-sspanel-build/v5.56.0-shared/artifacts`:
+
+- `v2ray-sspanel-shared` for production candidates.
+- `v2ray-sspanel-shared-pprof`, which enables metrics only when
+  `V2RAY_DEBUG_METRICS_ADDR` explicitly points to a loopback address.
+
+The ordinary production build has no pprof listener.
 
 ## Protocol scope
 

@@ -1,0 +1,15 @@
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {"tag": "socks-1", "listen": "127.0.0.1", "port": 26001, "protocol": "socks", "settings": {"udp": false}}
+  ],
+  "outbounds": [
+    {
+      "tag": "node-101",
+      "protocol": "vmess",
+      "settings": {"vnext": [{"address": "127.0.0.1", "port": 24001, "users": [{"id": "00000000-0000-0000-0000-000000000001", "alterId": 0, "security": "auto"}]}]},
+      "streamSettings": {"network": "ws", "wsSettings": {"path": "/n1"}}
+    }
+  ],
+  "routing": {"rules": [{"type": "field", "inboundTag": ["socks-1"], "outboundTag": "node-101"}]}
+}

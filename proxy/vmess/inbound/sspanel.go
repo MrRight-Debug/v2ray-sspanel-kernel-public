@@ -1,12 +1,8 @@
 package inbound
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -60,9 +56,9 @@ type sspanelUsersResponse struct {
 }
 
 type sspanelUser struct {
-	id         int64
+	shared     *sharedSSPanelUser
+	account    *vmess.MemoryAccount
 	email      string
-	uuid       string
 	alterID    uint32
 	level      uint32
 	upload     atomic.Int64
@@ -74,31 +70,28 @@ type sspanelUser struct {
 	activeIP map[string]int
 }
 
-func newSSPanelUser(id int64, email, uuid string, alterID, level uint32) *sspanelUser {
+func newSSPanelUser(
+	shared *sharedSSPanelUser,
+	email string,
+	alterID, level uint32,
+	account *vmess.MemoryAccount,
+) *sspanelUser {
 	return &sspanelUser{
-		id:       id,
+		shared:   shared,
+		account:  account,
 		email:    email,
-		uuid:     uuid,
 		alterID:  alterID,
 		level:    level,
 		activeIP: make(map[string]int),
 	}
 }
 
-func (u *sspanelUser) memoryUser() (*protocol.MemoryUser, error) {
-	rawAccount := &vmess.Account{
-		Id:      u.uuid,
-		AlterId: u.alterID,
-	}
-	account, err := rawAccount.AsAccount()
-	if err != nil {
-		return nil, err
-	}
+func (u *sspanelUser) memoryUser() *protocol.MemoryUser {
 	return &protocol.MemoryUser{
 		Level:   u.level,
 		Email:   u.email,
-		Account: account,
-	}, nil
+		Account: u.account,
+	}
 }
 
 func (u *sspanelUser) enterIP(ip string) {
@@ -137,7 +130,7 @@ func (u *sspanelUser) currentIPs() []string {
 type sspanelSync struct {
 	handler *Handler
 	config  SSPanelConfig
-	client  *http.Client
+	manager *sharedSSPanelManager
 
 	alterID   atomic.Uint32
 	connLimit atomic.Int64
@@ -145,28 +138,19 @@ type sspanelSync struct {
 
 	usersMu sync.RWMutex
 	users   map[string]*sspanelUser
+	appliedGeneration uint64
+	appliedAlterID    uint32
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
 func newSSPanelSync(handler *Handler, config *SSPanelConfig) *sspanelSync {
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 20 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
-	}
 	s := &sspanelSync{
 		handler: handler,
 		config:  *config,
-		client: &http.Client{
-			Transport: transport,
-			Timeout:   30 * time.Second,
-		},
-		users: make(map[string]*sspanelUser),
+		manager: sharedManagerFor(config),
+		users:   make(map[string]*sspanelUser),
 	}
 	// A server-side VMess account with 32 alter IDs accepts both the main AEAD
 	// identity (client alterId 0) and the generated legacy identities.
@@ -176,6 +160,7 @@ func newSSPanelSync(handler *Handler, config *SSPanelConfig) *sspanelSync {
 }
 
 func (s *sspanelSync) start(ctx context.Context) {
+	s.manager.acquire(ctx, s.config.NodeID, s.config.Refresh)
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	s.wg.Add(1)
@@ -190,12 +175,11 @@ func (s *sspanelSync) close() {
 		s.cancel()
 	}
 	s.wg.Wait()
-	if transport, ok := s.client.Transport.(*http.Transport); ok {
-		transport.CloseIdleConnections()
-	}
+	s.manager.release(s.config.NodeID)
 }
 
 func (s *sspanelSync) run(ctx context.Context) {
+	s.manager.waitReady(ctx)
 	s.tick(ctx)
 
 	interval := time.Duration(s.config.Refresh) * time.Second
@@ -230,64 +214,10 @@ func (s *sspanelSync) tick(ctx context.Context) {
 	}
 }
 
-func (s *sspanelSync) requestJSON(ctx context.Context, method, path string, query url.Values, payload, output interface{}) error {
-	requestURL := strings.TrimRight(s.config.URL, "/") + "/mod_mu/" + strings.TrimLeft(path, "/")
-	parsedURL, err := url.Parse(requestURL)
-	if err != nil {
-		return newError("invalid sspanel API URL")
-	}
-	values := parsedURL.Query()
-	values.Set("key", s.config.Key)
-	for key, entries := range query {
-		for _, entry := range entries {
-			values.Add(key, entry)
-		}
-	}
-	parsedURL.RawQuery = values.Encode()
-
-	var body io.Reader
-	if payload != nil {
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			return newError("failed to encode sspanel request")
-		}
-		body = bytes.NewReader(encoded)
-	}
-
-	request, err := http.NewRequestWithContext(ctx, method, parsedURL.String(), body)
-	if err != nil {
-		return newError("failed to create sspanel request")
-	}
-	request.Header.Set("User-Agent", "v2ray-sspanel/5.53.0")
-	if payload != nil {
-		request.Header.Set("Content-Type", "application/json")
-	}
-
-	response, err := s.client.Do(request)
-	if err != nil {
-		var urlError *url.Error
-		if errors.As(err, &urlError) {
-			err = urlError.Err
-		}
-		return newError("sspanel API ", path, " request failed").Base(err)
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusOK {
-		return newError("sspanel API ", path, " returned HTTP ", response.StatusCode)
-	}
-
-	decoder := json.NewDecoder(io.LimitReader(response.Body, maxSSPanelResponseSize))
-	if err := decoder.Decode(output); err != nil {
-		return newError("failed to decode sspanel API ", path, " response").Base(err)
-	}
-	return nil
-}
-
 func (s *sspanelSync) refreshNodeInfo(ctx context.Context) error {
 	response := new(sspanelNodeInfoResponse)
 	path := fmt.Sprintf("nodes/%d/info", s.config.NodeID)
-	if err := s.requestJSON(ctx, http.MethodGet, path, nil, nil, response); err != nil {
+	if _, err := s.manager.requestJSON(ctx, http.MethodGet, path, nil, nil, response, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {
@@ -304,36 +234,10 @@ func (s *sspanelSync) emailForUser(userID int64) string {
 }
 
 func (s *sspanelSync) syncUsers(ctx context.Context) error {
-	response := new(sspanelUsersResponse)
-	query := url.Values{"node_id": []string{strconv.FormatInt(s.config.NodeID, 10)}}
-	if err := s.requestJSON(ctx, http.MethodGet, "users", query, nil, response); err != nil {
-		return err
-	}
-	if response.Ret != 1 {
-		return newError("sspanel rejected user list request")
-	}
-
-	type desiredUser struct {
-		id      int64
-		email   string
-		uuid    string
-		alterID uint32
-		level   uint32
-	}
-	desired := make(map[string]desiredUser, len(response.Data))
 	alterID := s.alterID.Load()
-	for _, item := range response.Data {
-		if item.ID <= 0 || item.UUID == "" {
-			continue
-		}
-		email := s.emailForUser(item.ID)
-		desired[email] = desiredUser{
-			id:      item.ID,
-			email:   email,
-			uuid:    item.UUID,
-			alterID: alterID,
-			level:   0,
-		}
+	snapshot := s.manager.snapshot.Load()
+	if snapshot == nil {
+		return newError("shared sspanel user snapshot unavailable")
 	}
 
 	s.usersMu.RLock()
@@ -341,7 +245,17 @@ func (s *sspanelSync) syncUsers(ctx context.Context) error {
 	for email, user := range s.users {
 		current[email] = user
 	}
+	upToDate := s.appliedGeneration == snapshot.Generation && s.appliedAlterID == alterID
 	s.usersMu.RUnlock()
+	if upToDate {
+		return nil
+	}
+
+	desired := make(map[string]*sharedSSPanelUser, len(snapshot.Users))
+	for index := range snapshot.Users {
+		item := &snapshot.Users[index]
+		desired[s.emailForUser(item.ID)] = item
+	}
 
 	for email := range current {
 		if _, found := desired[email]; found {
@@ -357,22 +271,21 @@ func (s *sspanelSync) syncUsers(ctx context.Context) error {
 
 	for email, desiredUser := range desired {
 		if existing := current[email]; existing != nil &&
-			existing.uuid == desiredUser.uuid && existing.alterID == desiredUser.alterID {
+			existing.shared.UUID == desiredUser.UUID && existing.alterID == alterID {
 			continue
 		}
+		account, err := s.manager.accountFor(desiredUser.UUID, alterID)
+		if err != nil {
+			newError("sspanel: invalid VMess user from panel").Base(err).AtWarning().WriteToLog()
+			continue
+		}
+		user := newSSPanelUser(desiredUser, email, alterID, 0, account)
 		if current[email] != nil {
 			if err := s.handler.RemoveUser(ctx, email); err != nil {
 				newError("sspanel: failed to replace changed user").Base(err).AtDebug().WriteToLog()
 			}
 		}
-
-		user := newSSPanelUser(desiredUser.id, desiredUser.email, desiredUser.uuid, desiredUser.alterID, desiredUser.level)
-		memoryUser, err := user.memoryUser()
-		if err != nil {
-			newError("sspanel: invalid VMess user from panel").Base(err).AtWarning().WriteToLog()
-			continue
-		}
-		if err := s.handler.AddUser(ctx, memoryUser); err != nil {
+		if err := s.handler.AddUser(ctx, user.memoryUser()); err != nil {
 			newError("sspanel: failed to add user").Base(err).AtWarning().WriteToLog()
 			continue
 		}
@@ -380,6 +293,10 @@ func (s *sspanelSync) syncUsers(ctx context.Context) error {
 		s.users[email] = user
 		s.usersMu.Unlock()
 	}
+	s.usersMu.Lock()
+	s.appliedGeneration = snapshot.Generation
+	s.appliedAlterID = alterID
+	s.usersMu.Unlock()
 	return nil
 }
 
@@ -414,7 +331,7 @@ func (s *sspanelSync) reportTraffic(ctx context.Context) error {
 		}
 		reports = append(reports, report{user: user, upload: upload, down: down})
 		logs = append(logs, trafficLog{
-			UserID: user.id,
+			UserID: user.shared.ID,
 			Upload: uploadDelta,
 			Down:   downDelta,
 		})
@@ -428,7 +345,7 @@ func (s *sspanelSync) reportTraffic(ctx context.Context) error {
 	response := struct {
 		Ret int `json:"ret"`
 	}{}
-	if err := s.requestJSON(ctx, http.MethodPost, "users/traffic", query, payload, &response); err != nil {
+	if _, err := s.manager.requestJSON(ctx, http.MethodPost, "users/traffic", query, payload, &response, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {
@@ -458,7 +375,7 @@ func (s *sspanelSync) reportAliveIPs(ctx context.Context) error {
 	ips := make([]aliveIP, 0)
 	for _, user := range users {
 		for _, ip := range user.currentIPs() {
-			ips = append(ips, aliveIP{UserID: user.id, IP: ip})
+			ips = append(ips, aliveIP{UserID: user.shared.ID, IP: ip})
 		}
 	}
 	if len(ips) == 0 {
@@ -470,7 +387,7 @@ func (s *sspanelSync) reportAliveIPs(ctx context.Context) error {
 	response := struct {
 		Ret int `json:"ret"`
 	}{}
-	if err := s.requestJSON(ctx, http.MethodPost, "users/aliveip", query, payload, &response); err != nil {
+	if _, err := s.manager.requestJSON(ctx, http.MethodPost, "users/aliveip", query, payload, &response, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {

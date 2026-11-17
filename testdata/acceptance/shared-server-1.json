@@ -1,0 +1,23 @@
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "tag": "bench-node-101",
+      "listen": "127.0.0.1",
+      "port": 24001,
+      "protocol": "vmess",
+      "settings": {
+        "sspanel": {
+          "url": "http://127.0.0.1:23000",
+          "key": "bench-key",
+          "node_id": 101,
+          "refresh": 2,
+          "conn_limit": 800,
+          "share_group": "bench"
+        }
+      },
+      "streamSettings": {"network": "ws", "wsSettings": {"path": "/n1"}}
+    }
+  ],
+  "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+}
