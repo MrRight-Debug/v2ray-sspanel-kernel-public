@@ -3,6 +3,8 @@ package inbound
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +68,7 @@ type sspanelUser struct {
 	uuid       string
 	alterID    uint32
 	level      uint32
+	account    *vmess.MemoryAccount
 	upload     atomic.Int64
 	download   atomic.Int64
 	reportedUp atomic.Int64
@@ -74,31 +78,128 @@ type sspanelUser struct {
 	activeIP map[string]int
 }
 
-func newSSPanelUser(id int64, email, uuid string, alterID, level uint32) *sspanelUser {
+type sharedAuthUser struct {
+	id      int64
+	email   string
+	uuid    string
+	alterID uint32
+	level   uint32
+}
+
+type sharedAuthBucket struct {
+	validator *vmess.TimedUserValidator
+	users     map[string]*protocol.MemoryUser
+	refs      int
+}
+
+var sharedAuthBuckets = struct {
+	sync.Mutex
+	buckets map[[32]byte]*sharedAuthBucket
+}{
+	buckets: make(map[[32]byte]*sharedAuthBucket),
+}
+
+func sharedAuthKey(users []sharedAuthUser) [32]byte {
+	hasher := sha256.New()
+	var numeric [8]byte
+	for _, user := range users {
+		binary.LittleEndian.PutUint64(numeric[:], uint64(user.id))
+		_, _ = hasher.Write(numeric[:])
+		_, _ = hasher.Write([]byte(user.email))
+		_, _ = hasher.Write([]byte{0})
+		_, _ = hasher.Write([]byte(user.uuid))
+		_, _ = hasher.Write([]byte{0})
+		binary.LittleEndian.PutUint64(numeric[:], uint64(user.alterID))
+		_, _ = hasher.Write(numeric[:])
+		binary.LittleEndian.PutUint64(numeric[:], uint64(user.level))
+		_, _ = hasher.Write(numeric[:])
+	}
+	var key [32]byte
+	copy(key[:], hasher.Sum(nil))
+	return key
+}
+
+func acquireSharedAuth(users []sharedAuthUser) ([32]byte, *sharedAuthBucket, error) {
+	sort.Slice(users, func(i, j int) bool { return users[i].email < users[j].email })
+	key := sharedAuthKey(users)
+
+	sharedAuthBuckets.Lock()
+	defer sharedAuthBuckets.Unlock()
+	if bucket := sharedAuthBuckets.buckets[key]; bucket != nil {
+		bucket.refs++
+		return key, bucket, nil
+	}
+
+	validator := vmess.NewTimedUserValidator(protocol.DefaultIDHash)
+	memoryUsers := make(map[string]*protocol.MemoryUser, len(users))
+	for _, item := range users {
+		rawAccount := &vmess.Account{Id: item.uuid, AlterId: item.alterID}
+		accountValue, err := rawAccount.AsAccount()
+		if err != nil {
+			validator.Close()
+			return [32]byte{}, nil, err
+		}
+		memoryUser := &protocol.MemoryUser{
+			Level:   item.level,
+			Email:   item.email,
+			Account: accountValue,
+		}
+		if err := validator.Add(memoryUser); err != nil {
+			validator.Close()
+			return [32]byte{}, nil, err
+		}
+		memoryUsers[item.email] = memoryUser
+	}
+	bucket := &sharedAuthBucket{
+		validator: validator,
+		users:     memoryUsers,
+		refs:      1,
+	}
+	sharedAuthBuckets.buckets[key] = bucket
+	return key, bucket, nil
+}
+
+func releaseSharedAuth(bucket *sharedAuthBucket) {
+	if bucket == nil {
+		return
+	}
+	sharedAuthBuckets.Lock()
+	if bucket.refs > 0 {
+		bucket.refs--
+	}
+	last := bucket.refs == 0
+	if last {
+		for key, candidate := range sharedAuthBuckets.buckets {
+			if candidate == bucket {
+				delete(sharedAuthBuckets.buckets, key)
+				break
+			}
+		}
+	}
+	sharedAuthBuckets.Unlock()
+	if last {
+		bucket.validator.Close()
+	}
+}
+
+func newSSPanelUser(id int64, email, uuid string, alterID, level uint32, account *vmess.MemoryAccount) *sspanelUser {
 	return &sspanelUser{
 		id:       id,
 		email:    email,
 		uuid:     uuid,
 		alterID:  alterID,
 		level:    level,
+		account:  account,
 		activeIP: make(map[string]int),
 	}
 }
 
-func (u *sspanelUser) memoryUser() (*protocol.MemoryUser, error) {
-	rawAccount := &vmess.Account{
-		Id:      u.uuid,
-		AlterId: u.alterID,
-	}
-	account, err := rawAccount.AsAccount()
-	if err != nil {
-		return nil, err
-	}
+func (u *sspanelUser) memoryUser() *protocol.MemoryUser {
 	return &protocol.MemoryUser{
 		Level:   u.level,
 		Email:   u.email,
-		Account: account,
-	}, nil
+		Account: u.account,
+	}
 }
 
 func (u *sspanelUser) enterIP(ip string) {
@@ -135,11 +236,14 @@ func (u *sspanelUser) currentIPs() []string {
 }
 
 type sspanelSync struct {
-	handler *Handler
-	config  SSPanelConfig
-	client  *http.Client
-	etag    string
-	lastMod string
+	handler        *Handler
+	config         SSPanelConfig
+	client         *http.Client
+	etag           string
+	lastMod        string
+	authKey        [32]byte
+	auth           *sharedAuthBucket
+	appliedAlterID uint32
 
 	alterID   atomic.Uint32
 	connLimit atomic.Int64
@@ -192,6 +296,8 @@ func (s *sspanelSync) close() {
 		s.cancel()
 	}
 	s.wg.Wait()
+	releaseSharedAuth(s.auth)
+	s.auth = nil
 	if transport, ok := s.client.Transport.(*http.Transport); ok {
 		transport.CloseIdleConnections()
 	}
@@ -327,24 +433,26 @@ func (s *sspanelSync) refreshNodeInfo(ctx context.Context) error {
 }
 
 func (s *sspanelSync) emailForUser(userID int64) string {
-	return fmt.Sprintf("sspanel-%d-%d", s.config.NodeID, userID)
+	return fmt.Sprintf("sspanel-%d", userID)
 }
 
 func (s *sspanelSync) syncUsers(ctx context.Context) error {
+	alterID := s.alterID.Load()
 	response := new(sspanelUsersResponse)
 	query := url.Values{"node_id": []string{strconv.FormatInt(s.config.NodeID, 10)}}
 	headers := make(http.Header)
-	if s.etag != "" {
+	alterChanged := s.auth == nil || s.appliedAlterID != alterID
+	if !alterChanged && s.etag != "" {
 		headers.Set("If-None-Match", s.etag)
 	}
-	if s.lastMod != "" {
+	if !alterChanged && s.lastMod != "" {
 		headers.Set("If-Modified-Since", s.lastMod)
 	}
 	meta, err := s.requestJSON(ctx, http.MethodGet, "users", query, nil, response, headers)
 	if err != nil {
 		return err
 	}
-	if meta.NotModified {
+	if meta.NotModified && !alterChanged {
 		return nil
 	}
 	if response.Ret != 1 {
@@ -353,75 +461,48 @@ func (s *sspanelSync) syncUsers(ctx context.Context) error {
 	s.etag = meta.ETag
 	s.lastMod = meta.LastModified
 
-	type desiredUser struct {
-		id      int64
-		email   string
-		uuid    string
-		alterID uint32
-		level   uint32
-	}
-	desired := make(map[string]desiredUser, len(response.Data))
-	alterID := s.alterID.Load()
+	desired := make([]sharedAuthUser, 0, len(response.Data))
 	for _, item := range response.Data {
 		if item.ID <= 0 || item.UUID == "" {
 			continue
 		}
-		email := s.emailForUser(item.ID)
-		desired[email] = desiredUser{
+		desired = append(desired, sharedAuthUser{
 			id:      item.ID,
-			email:   email,
+			email:   s.emailForUser(item.ID),
 			uuid:    item.UUID,
 			alterID: alterID,
 			level:   0,
-		}
+		})
 	}
 
-	s.usersMu.RLock()
-	current := make(map[string]*sspanelUser, len(s.users))
-	for email, user := range s.users {
-		current[email] = user
+	key, bucket, err := acquireSharedAuth(desired)
+	if err != nil {
+		return newError("failed to build shared authentication index").Base(err)
 	}
-	s.usersMu.RUnlock()
-
-	for email := range current {
-		if _, found := desired[email]; found {
-			continue
-		}
-		if err := s.handler.RemoveUser(ctx, email); err != nil {
-			newError("sspanel: failed to remove stale user").Base(err).AtDebug().WriteToLog()
-			continue
-		}
-		s.usersMu.Lock()
-		delete(s.users, email)
-		s.usersMu.Unlock()
+	if s.auth == bucket {
+		releaseSharedAuth(bucket)
+		return nil
 	}
 
-	for email, desiredUser := range desired {
-		if existing := current[email]; existing != nil &&
-			existing.uuid == desiredUser.uuid && existing.alterID == desiredUser.alterID {
-			continue
-		}
-		if current[email] != nil {
-			if err := s.handler.RemoveUser(ctx, email); err != nil {
-				newError("sspanel: failed to replace changed user").Base(err).AtDebug().WriteToLog()
-				continue
-			}
-		}
-
-		user := newSSPanelUser(desiredUser.id, desiredUser.email, desiredUser.uuid, desiredUser.alterID, desiredUser.level)
-		memoryUser, err := user.memoryUser()
-		if err != nil {
-			newError("sspanel: invalid VMess user from panel").Base(err).AtWarning().WriteToLog()
-			continue
-		}
-		if err := s.handler.AddUser(ctx, memoryUser); err != nil {
-			newError("sspanel: failed to add user").Base(err).AtWarning().WriteToLog()
-			continue
-		}
-		s.usersMu.Lock()
-		s.users[email] = user
-		s.usersMu.Unlock()
+	nextUsers := make(map[string]*sspanelUser, len(desired))
+	for _, item := range desired {
+		memoryUser := bucket.users[item.email]
+		account := memoryUser.Account.(*vmess.MemoryAccount)
+		nextUsers[item.email] = newSSPanelUser(
+			item.id, item.email, item.uuid, item.alterID, item.level, account,
+		)
 	}
+
+	s.handler.replaceSSPanelAuth(bucket.validator, bucket.users)
+	s.usersMu.Lock()
+	s.users = nextUsers
+	s.usersMu.Unlock()
+
+	oldBucket := s.auth
+	s.authKey = key
+	s.auth = bucket
+	s.appliedAlterID = alterID
+	releaseSharedAuth(oldBucket)
 	return nil
 }
 

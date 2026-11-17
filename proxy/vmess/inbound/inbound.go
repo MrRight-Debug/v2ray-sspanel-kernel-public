@@ -100,11 +100,22 @@ func (v *userByEmail) Remove(email string) bool {
 	return true
 }
 
+func (v *userByEmail) Replace(users map[string]*protocol.MemoryUser) {
+	v.Lock()
+	defer v.Unlock()
+	v.cache = make(map[string]*protocol.MemoryUser, len(users))
+	for email, user := range users {
+		v.cache[strings.ToLower(email)] = user
+	}
+}
+
 // Handler is an inbound connection handler that handles messages in VMess protocol.
 type Handler struct {
 	policyManager         policy.Manager
 	inboundHandlerManager feature_inbound.Manager
+	clientsMu             sync.RWMutex
 	clients               *vmess.TimedUserValidator
+	clientsOwned          bool
 	usersByEmail          *userByEmail
 	detours               *DetourConfig
 	sessionHistory        *encoding.SessionHistory
@@ -120,6 +131,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		policyManager:         v.GetFeature(policy.ManagerType()).(policy.Manager),
 		inboundHandlerManager: v.GetFeature(feature_inbound.ManagerType()).(feature_inbound.Manager),
 		clients:               vmess.NewTimedUserValidator(protocol.DefaultIDHash),
+		clientsOwned:          true,
 		detours:               config.Detour,
 		usersByEmail:          newUserByEmail(config.GetDefaultValue()),
 		sessionHistory:        encoding.NewSessionHistory(),
@@ -149,8 +161,18 @@ func (h *Handler) Close() error {
 	if sspanel != nil {
 		sspanel.close()
 	}
+	h.clientsMu.Lock()
+	clients := h.clients
+	owned := h.clientsOwned
+	h.clients = nil
+	h.clientsOwned = false
+	h.clientsMu.Unlock()
+	var closeClients error
+	if clients != nil && owned {
+		closeClients = clients.Close()
+	}
 	return errors.Combine(
-		h.clients.Close(),
+		closeClients,
 		h.sessionHistory.Close(),
 		common.Close(h.usersByEmail))
 }
@@ -190,7 +212,7 @@ func (*Handler) Network() []net.Network {
 func (h *Handler) GetUser(email string) *protocol.MemoryUser {
 	user, existing := h.usersByEmail.Get(email)
 	if !existing {
-		h.clients.Add(user)
+		return nil
 	}
 	return user
 }
@@ -199,7 +221,7 @@ func (h *Handler) AddUser(ctx context.Context, user *protocol.MemoryUser) error 
 	if len(user.Email) > 0 && !h.usersByEmail.Add(user) {
 		return newError("User ", user.Email, " already exists.")
 	}
-	return h.clients.Add(user)
+	return h.currentClients().Add(user)
 }
 
 func (h *Handler) RemoveUser(ctx context.Context, email string) error {
@@ -209,8 +231,30 @@ func (h *Handler) RemoveUser(ctx context.Context, email string) error {
 	if !h.usersByEmail.Remove(email) {
 		return newError("User ", email, " not found.")
 	}
-	h.clients.Remove(email)
+	h.currentClients().Remove(email)
 	return nil
+}
+
+func (h *Handler) currentClients() *vmess.TimedUserValidator {
+	h.clientsMu.RLock()
+	defer h.clientsMu.RUnlock()
+	return h.clients
+}
+
+func (h *Handler) replaceSSPanelAuth(
+	validator *vmess.TimedUserValidator,
+	users map[string]*protocol.MemoryUser,
+) {
+	h.usersByEmail.Replace(users)
+	h.clientsMu.Lock()
+	old := h.clients
+	oldOwned := h.clientsOwned
+	h.clients = validator
+	h.clientsOwned = false
+	h.clientsMu.Unlock()
+	if old != nil && oldOwned {
+		_ = old.Close()
+	}
 }
 
 func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSession, request *protocol.RequestHeader, response *protocol.ResponseHeader, input buf.Reader, output *buf.BufferedWriter) error {
@@ -266,7 +310,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 	}
 
 	reader := &buf.BufferedReader{Reader: buf.NewReader(connection)}
-	svrSession := encoding.NewServerSession(h.clients, h.sessionHistory)
+	svrSession := encoding.NewServerSession(h.currentClients(), h.sessionHistory)
 	svrSession.SetAEADForced(aeadForced)
 	request, err := svrSession.DecodeRequestHeader(reader)
 	if err != nil {
