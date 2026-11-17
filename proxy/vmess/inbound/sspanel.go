@@ -70,7 +70,7 @@ type sspanelUser struct {
 	reportedUp atomic.Int64
 	reportedDn atomic.Int64
 
-	ipMu    sync.Mutex
+	ipMu     sync.Mutex
 	activeIP map[string]int
 }
 
@@ -138,6 +138,8 @@ type sspanelSync struct {
 	handler *Handler
 	config  SSPanelConfig
 	client  *http.Client
+	etag    string
+	lastMod string
 
 	alterID   atomic.Uint32
 	connLimit atomic.Int64
@@ -230,11 +232,23 @@ func (s *sspanelSync) tick(ctx context.Context) {
 	}
 }
 
-func (s *sspanelSync) requestJSON(ctx context.Context, method, path string, query url.Values, payload, output interface{}) error {
+type sspanelHTTPMeta struct {
+	ETag         string
+	LastModified string
+	NotModified  bool
+}
+
+func (s *sspanelSync) requestJSON(
+	ctx context.Context,
+	method, path string,
+	query url.Values,
+	payload, output interface{},
+	headers http.Header,
+) (*sspanelHTTPMeta, error) {
 	requestURL := strings.TrimRight(s.config.URL, "/") + "/mod_mu/" + strings.TrimLeft(path, "/")
 	parsedURL, err := url.Parse(requestURL)
 	if err != nil {
-		return newError("invalid sspanel API URL")
+		return nil, newError("invalid sspanel API URL")
 	}
 	values := parsedURL.Query()
 	values.Set("key", s.config.Key)
@@ -249,18 +263,23 @@ func (s *sspanelSync) requestJSON(ctx context.Context, method, path string, quer
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
 		if err != nil {
-			return newError("failed to encode sspanel request")
+			return nil, newError("failed to encode sspanel request")
 		}
 		body = bytes.NewReader(encoded)
 	}
 
 	request, err := http.NewRequestWithContext(ctx, method, parsedURL.String(), body)
 	if err != nil {
-		return newError("failed to create sspanel request")
+		return nil, newError("failed to create sspanel request")
 	}
-	request.Header.Set("User-Agent", "v2ray-sspanel/5.53.0")
+	request.Header.Set("User-Agent", "v2ray-sspanel/5.56.0")
 	if payload != nil {
 		request.Header.Set("Content-Type", "application/json")
+	}
+	for name, entries := range headers {
+		for _, entry := range entries {
+			request.Header.Add(name, entry)
+		}
 	}
 
 	response, err := s.client.Do(request)
@@ -269,25 +288,33 @@ func (s *sspanelSync) requestJSON(ctx context.Context, method, path string, quer
 		if errors.As(err, &urlError) {
 			err = urlError.Err
 		}
-		return newError("sspanel API ", path, " request failed").Base(err)
+		return nil, newError("sspanel API ", path, " request failed").Base(err)
 	}
 	defer response.Body.Close()
 
+	meta := &sspanelHTTPMeta{
+		ETag:         response.Header.Get("ETag"),
+		LastModified: response.Header.Get("Last-Modified"),
+	}
+	if response.StatusCode == http.StatusNotModified {
+		meta.NotModified = true
+		return meta, nil
+	}
 	if response.StatusCode != http.StatusOK {
-		return newError("sspanel API ", path, " returned HTTP ", response.StatusCode)
+		return nil, newError("sspanel API ", path, " returned HTTP ", response.StatusCode)
 	}
 
 	decoder := json.NewDecoder(io.LimitReader(response.Body, maxSSPanelResponseSize))
 	if err := decoder.Decode(output); err != nil {
-		return newError("failed to decode sspanel API ", path, " response").Base(err)
+		return nil, newError("failed to decode sspanel API ", path, " response").Base(err)
 	}
-	return nil
+	return meta, nil
 }
 
 func (s *sspanelSync) refreshNodeInfo(ctx context.Context) error {
 	response := new(sspanelNodeInfoResponse)
 	path := fmt.Sprintf("nodes/%d/info", s.config.NodeID)
-	if err := s.requestJSON(ctx, http.MethodGet, path, nil, nil, response); err != nil {
+	if _, err := s.requestJSON(ctx, http.MethodGet, path, nil, nil, response, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {
@@ -306,12 +333,25 @@ func (s *sspanelSync) emailForUser(userID int64) string {
 func (s *sspanelSync) syncUsers(ctx context.Context) error {
 	response := new(sspanelUsersResponse)
 	query := url.Values{"node_id": []string{strconv.FormatInt(s.config.NodeID, 10)}}
-	if err := s.requestJSON(ctx, http.MethodGet, "users", query, nil, response); err != nil {
+	headers := make(http.Header)
+	if s.etag != "" {
+		headers.Set("If-None-Match", s.etag)
+	}
+	if s.lastMod != "" {
+		headers.Set("If-Modified-Since", s.lastMod)
+	}
+	meta, err := s.requestJSON(ctx, http.MethodGet, "users", query, nil, response, headers)
+	if err != nil {
 		return err
+	}
+	if meta.NotModified {
+		return nil
 	}
 	if response.Ret != 1 {
 		return newError("sspanel rejected user list request")
 	}
+	s.etag = meta.ETag
+	s.lastMod = meta.LastModified
 
 	type desiredUser struct {
 		id      int64
@@ -349,6 +389,7 @@ func (s *sspanelSync) syncUsers(ctx context.Context) error {
 		}
 		if err := s.handler.RemoveUser(ctx, email); err != nil {
 			newError("sspanel: failed to remove stale user").Base(err).AtDebug().WriteToLog()
+			continue
 		}
 		s.usersMu.Lock()
 		delete(s.users, email)
@@ -363,6 +404,7 @@ func (s *sspanelSync) syncUsers(ctx context.Context) error {
 		if current[email] != nil {
 			if err := s.handler.RemoveUser(ctx, email); err != nil {
 				newError("sspanel: failed to replace changed user").Base(err).AtDebug().WriteToLog()
+				continue
 			}
 		}
 
@@ -428,7 +470,7 @@ func (s *sspanelSync) reportTraffic(ctx context.Context) error {
 	response := struct {
 		Ret int `json:"ret"`
 	}{}
-	if err := s.requestJSON(ctx, http.MethodPost, "users/traffic", query, payload, &response); err != nil {
+	if _, err := s.requestJSON(ctx, http.MethodPost, "users/traffic", query, payload, &response, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {
@@ -470,7 +512,7 @@ func (s *sspanelSync) reportAliveIPs(ctx context.Context) error {
 	response := struct {
 		Ret int `json:"ret"`
 	}{}
-	if err := s.requestJSON(ctx, http.MethodPost, "users/aliveip", query, payload, &response); err != nil {
+	if _, err := s.requestJSON(ctx, http.MethodPost, "users/aliveip", query, payload, &response, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {
@@ -541,4 +583,3 @@ func remoteIP(address net.Addr) string {
 	}
 	return parsed.String()
 }
-
