@@ -241,6 +241,8 @@ type sspanelSync struct {
 	client         *http.Client
 	etag           string
 	lastMod        string
+	bodyHash       [32]byte
+	hasBodyHash    bool
 	authKey        [32]byte
 	auth           *sharedAuthBucket
 	appliedAlterID uint32
@@ -339,9 +341,12 @@ func (s *sspanelSync) tick(ctx context.Context) {
 }
 
 type sspanelHTTPMeta struct {
-	ETag         string
-	LastModified string
-	NotModified  bool
+	ETag          string
+	LastModified  string
+	NotModified   bool
+	BodySHA256    [32]byte
+	HasBody       bool
+	BodyUnchanged bool
 }
 
 func (s *sspanelSync) requestJSON(
@@ -349,6 +354,7 @@ func (s *sspanelSync) requestJSON(
 	method, path string,
 	query url.Values,
 	payload, output interface{},
+	previousBodyHash *[32]byte,
 	headers http.Header,
 ) (*sspanelHTTPMeta, error) {
 	requestURL := strings.TrimRight(s.config.URL, "/") + "/mod_mu/" + strings.TrimLeft(path, "/")
@@ -410,7 +416,21 @@ func (s *sspanelSync) requestJSON(
 		return nil, newError("sspanel API ", path, " returned HTTP ", response.StatusCode)
 	}
 
-	decoder := json.NewDecoder(io.LimitReader(response.Body, maxSSPanelResponseSize))
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxSSPanelResponseSize+1))
+	if err != nil {
+		return nil, newError("failed to read sspanel API ", path, " response").Base(err)
+	}
+	if len(responseBody) > maxSSPanelResponseSize {
+		return nil, newError("sspanel API ", path, " response exceeds size limit")
+	}
+	meta.BodySHA256 = sha256.Sum256(responseBody)
+	meta.HasBody = true
+	if previousBodyHash != nil && *previousBodyHash == meta.BodySHA256 {
+		meta.BodyUnchanged = true
+		return meta, nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
 	if err := decoder.Decode(output); err != nil {
 		return nil, newError("failed to decode sspanel API ", path, " response").Base(err)
 	}
@@ -420,7 +440,7 @@ func (s *sspanelSync) requestJSON(
 func (s *sspanelSync) refreshNodeInfo(ctx context.Context) error {
 	response := new(sspanelNodeInfoResponse)
 	path := fmt.Sprintf("nodes/%d/info", s.config.NodeID)
-	if _, err := s.requestJSON(ctx, http.MethodGet, path, nil, nil, response, nil); err != nil {
+	if _, err := s.requestJSON(ctx, http.MethodGet, path, nil, nil, response, nil, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {
@@ -448,18 +468,27 @@ func (s *sspanelSync) syncUsers(ctx context.Context) error {
 	if !alterChanged && s.lastMod != "" {
 		headers.Set("If-Modified-Since", s.lastMod)
 	}
-	meta, err := s.requestJSON(ctx, http.MethodGet, "users", query, nil, response, headers)
+	var previousBodyHash *[32]byte
+	if !alterChanged && s.hasBodyHash {
+		previousBodyHash = &s.bodyHash
+	}
+	meta, err := s.requestJSON(ctx, http.MethodGet, "users", query, nil, response, previousBodyHash, headers)
 	if err != nil {
 		return err
 	}
 	if meta.NotModified && !alterChanged {
 		return nil
 	}
+	s.etag = meta.ETag
+	s.lastMod = meta.LastModified
+	if meta.BodyUnchanged && !alterChanged {
+		return nil
+	}
 	if response.Ret != 1 {
 		return newError("sspanel rejected user list request")
 	}
-	s.etag = meta.ETag
-	s.lastMod = meta.LastModified
+	s.bodyHash = meta.BodySHA256
+	s.hasBodyHash = true
 
 	desired := make([]sharedAuthUser, 0, len(response.Data))
 	for _, item := range response.Data {
@@ -551,7 +580,7 @@ func (s *sspanelSync) reportTraffic(ctx context.Context) error {
 	response := struct {
 		Ret int `json:"ret"`
 	}{}
-	if _, err := s.requestJSON(ctx, http.MethodPost, "users/traffic", query, payload, &response, nil); err != nil {
+	if _, err := s.requestJSON(ctx, http.MethodPost, "users/traffic", query, payload, &response, nil, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {
@@ -593,7 +622,7 @@ func (s *sspanelSync) reportAliveIPs(ctx context.Context) error {
 	response := struct {
 		Ret int `json:"ret"`
 	}{}
-	if _, err := s.requestJSON(ctx, http.MethodPost, "users/aliveip", query, payload, &response, nil); err != nil {
+	if _, err := s.requestJSON(ctx, http.MethodPost, "users/aliveip", query, payload, &response, nil, nil); err != nil {
 		return err
 	}
 	if response.Ret != 1 {

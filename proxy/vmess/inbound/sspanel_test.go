@@ -17,6 +17,58 @@ import (
 	"github.com/v2fly/v2ray-core/v5/proxy/vmess"
 )
 
+type countingJSONResponse struct {
+	Ret     int
+	Decodes *atomic.Int32
+}
+
+func (r *countingJSONResponse) UnmarshalJSON(data []byte) error {
+	r.Decodes.Add(1)
+	type plain countingJSONResponse
+	return json.Unmarshal(data, (*plain)(r))
+}
+
+func TestSSPanelUnchangedBodySkipsJSONDecode(t *testing.T) {
+	var requests atomic.Int32
+	panel := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		_, _ = response.Write([]byte(`{"ret":1,"data":[]}`))
+	}))
+	defer panel.Close()
+
+	sync := newSSPanelSync(&Handler{}, &SSPanelConfig{
+		URL:    panel.URL,
+		Key:    "test-key",
+		NodeID: 21,
+	})
+	defer sync.close()
+
+	var decodes atomic.Int32
+	first := &countingJSONResponse{Decodes: &decodes}
+	firstMeta, err := sync.requestJSON(
+		context.Background(), http.MethodGet, "users", nil, nil, first, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := &countingJSONResponse{Decodes: &decodes}
+	secondMeta, err := sync.requestJSON(
+		context.Background(), http.MethodGet, "users", nil, nil, second, &firstMeta.BodySHA256, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("unexpected request count: %d", requests.Load())
+	}
+	if decodes.Load() != 1 {
+		t.Fatalf("unchanged body was decoded %d times", decodes.Load())
+	}
+	if !secondMeta.BodyUnchanged {
+		t.Fatal("expected unchanged body hash")
+	}
+}
+
 func TestSSPanelSyncUsersTrafficAndIPs(t *testing.T) {
 	const testUUID = "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082"
 	var trafficPayload []byte
