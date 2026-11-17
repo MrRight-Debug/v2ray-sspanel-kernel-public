@@ -6,17 +6,27 @@ The manager key is derived from panel URL, authentication key and
 `share_group`. One manager owns:
 
 - a shared HTTP transport/TLS pool;
-- one `/mod_mu/users` polling loop;
-- conditional request state for ETag and Last-Modified;
+- one polling loop that sends one conditional `/mod_mu/users?node_id=...`
+  request for every registered node;
+- independent ETag and Last-Modified state for every node;
 - an immutable, atomically published user snapshot;
 - a shared VMess account metadata cache keyed by UUID and alter ID.
 
 Each inbound keeps its own `node_id` info polling, projected user map,
 connection limit, VMess validator, traffic counters and active-IP state.
 
-ETag `304` and unchanged semantic response hashes do not create a new snapshot
-generation. A failed poll keeps the last valid snapshot and retries with
-exponential backoff capped at five minutes.
+The per-node users request is required even when the user snapshot is shared:
+SSPanel updates `node_heartbeat` and checks node bandwidth in this handler.
+ETag `304` therefore still performs the required node-side effects. A 304
+response is not decoded. The source node's full response is parsed at most once;
+other node responses are streamed to a hash and discarded when they match the
+source. Unchanged semantic response hashes do not create a new snapshot
+generation. If a node's response hash differs, that node is isolated from the
+shared snapshot rather than receiving another node's user permissions.
+
+A completely failed poll keeps the last valid snapshot and retries with
+exponential backoff capped at five minutes. Partial failures do not delay the
+next normal refresh cycle.
 
 ## Compatibility
 

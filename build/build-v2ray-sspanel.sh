@@ -25,7 +25,7 @@ GOARCH=amd64 \
 GOAMD64=v1 \
 go build \
   -trimpath \
-  -ldflags="-s -w -buildid= -X github.com/v2fly/v2ray-core/v5.build=SSPanel-shared-Go1.27.4-static" \
+  -ldflags="-s -w -buildid= -X github.com/v2fly/v2ray-core/v5.build=SSPanel-shared-heartbeat-Go1.27.4-static" \
   -o "$artifact_dir/v2ray-sspanel-shared" \
   ./main/slim
 
@@ -36,7 +36,7 @@ GOAMD64=v1 \
 go build \
   -tags pprof \
   -trimpath \
-  -ldflags="-s -w -buildid= -X github.com/v2fly/v2ray-core/v5.build=SSPanel-shared-profile-Go1.27.4" \
+  -ldflags="-s -w -buildid= -X github.com/v2fly/v2ray-core/v5.build=SSPanel-shared-heartbeat-profile-Go1.27.4" \
   -o "$artifact_dir/v2ray-sspanel-shared-pprof" \
   ./main/slim
 

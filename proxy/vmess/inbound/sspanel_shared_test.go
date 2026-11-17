@@ -14,10 +14,12 @@ import (
 	"github.com/v2fly/v2ray-core/v5/proxy/vmess"
 )
 
-func TestSharedSSPanelETagAndResponseHashDedupe(t *testing.T) {
+func TestSharedSSPanelRefreshesEveryNodeWithConditionalRequests(t *testing.T) {
 	const userUUID = "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082"
-	var requests atomic.Int32
-	var notModified atomic.Int32
+	var requestsNode1 atomic.Int32
+	var requestsNode2 atomic.Int32
+	var notModifiedNode1 atomic.Int32
+	var notModifiedNode2 atomic.Int32
 	var forceChangedETag atomic.Bool
 
 	panel := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -25,9 +27,23 @@ func TestSharedSSPanelETagAndResponseHashDedupe(t *testing.T) {
 			http.NotFound(response, request)
 			return
 		}
-		requests.Add(1)
+		nodeID := request.URL.Query().Get("node_id")
+		switch nodeID {
+		case "1":
+			requestsNode1.Add(1)
+		case "2":
+			requestsNode2.Add(1)
+		default:
+			t.Errorf("unexpected node_id: %s", nodeID)
+			http.Error(response, "unexpected node", http.StatusBadRequest)
+			return
+		}
 		if request.Header.Get("If-None-Match") == `"users-v1"` && !forceChangedETag.Load() {
-			notModified.Add(1)
+			if nodeID == "1" {
+				notModifiedNode1.Add(1)
+			} else {
+				notModifiedNode2.Add(1)
+			}
 			response.WriteHeader(http.StatusNotModified)
 			return
 		}
@@ -72,8 +88,9 @@ func TestSharedSSPanelETagAndResponseHashDedupe(t *testing.T) {
 	if second != first {
 		t.Fatal("expected 304 to preserve the immutable snapshot")
 	}
-	if notModified.Load() != 1 {
-		t.Fatalf("expected one conditional request, got %d", notModified.Load())
+	if notModifiedNode1.Load() != 1 || notModifiedNode2.Load() != 1 {
+		t.Fatalf("expected one conditional request per node, got node1=%d node2=%d",
+			notModifiedNode1.Load(), notModifiedNode2.Load())
 	}
 
 	forceChangedETag.Store(true)
@@ -87,8 +104,65 @@ func TestSharedSSPanelETagAndResponseHashDedupe(t *testing.T) {
 	if third.Generation != first.Generation {
 		t.Fatalf("generation changed unexpectedly: %d", third.Generation)
 	}
-	if requests.Load() != 3 {
-		t.Fatalf("unexpected request count: %d", requests.Load())
+	if requestsNode1.Load() != 3 || requestsNode2.Load() != 3 {
+		t.Fatalf("unexpected request counts: node1=%d node2=%d",
+			requestsNode1.Load(), requestsNode2.Load())
+	}
+}
+
+func TestSharedSSPanelRejectsDivergentUserResponsesWithoutSharing(t *testing.T) {
+	const userUUID = "4f8e1c60-2c4b-4b80-8f53-0d34ce5b8082"
+	panel := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/mod_mu/users" {
+			http.NotFound(response, request)
+			return
+		}
+		userID := "42"
+		if request.URL.Query().Get("node_id") == "2" {
+			userID = "43"
+		}
+		response.Header().Set("ETag", `"users-node-`+request.URL.Query().Get("node_id")+`"`)
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"ret":1,"data":[{"id":` + userID + `,"uuid":"` + userUUID + `"}]}`))
+	}))
+	defer panel.Close()
+
+	config := &SSPanelConfig{
+		URL:        panel.URL,
+		Key:        "shared-key",
+		NodeID:     1,
+		Refresh:    60,
+		ShareGroup: "divergent-test",
+	}
+	manager := sharedManagerFor(config)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	manager.acquire(ctx, 1, 60)
+	manager.acquire(ctx, 2, 60)
+	defer manager.release(1)
+	defer manager.release(2)
+	manager.waitReady(ctx)
+
+	snapshot, err := manager.snapshotForNode(1)
+	if err != nil || snapshot == nil || len(snapshot.Users) != 1 || snapshot.Users[0].ID != 42 {
+		t.Fatalf("unexpected source snapshot: snapshot=%+v err=%v", snapshot, err)
+	}
+	if snapshot, err := manager.snapshotForNode(2); err == nil || snapshot != nil {
+		t.Fatalf("divergent node must not receive the source snapshot: snapshot=%+v err=%v", snapshot, err)
+	}
+
+	config.NodeID = 2
+	clients := vmess.NewTimedUserValidator(protocol.DefaultIDHash)
+	defer clients.Close()
+	sync := newSSPanelSync(&Handler{
+		clients:      clients,
+		usersByEmail: newUserByEmail(&DefaultConfig{AlterId: 32}),
+	}, config)
+	if err := sync.syncUsers(ctx); err == nil {
+		t.Fatal("expected divergent node user sync to fail closed")
+	}
+	if user := sync.getUser(sync.emailForUser(42)); user != nil {
+		t.Fatalf("divergent node received a source-scope user: %+v", user)
 	}
 }
 

@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -66,7 +67,7 @@ type sspanelUser struct {
 	reportedUp atomic.Int64
 	reportedDn atomic.Int64
 
-	ipMu    sync.Mutex
+	ipMu     sync.Mutex
 	activeIP map[string]int
 }
 
@@ -136,8 +137,8 @@ type sspanelSync struct {
 	connLimit atomic.Int64
 	active    atomic.Int64
 
-	usersMu sync.RWMutex
-	users   map[string]*sspanelUser
+	usersMu           sync.RWMutex
+	users             map[string]*sspanelUser
 	appliedGeneration uint64
 	appliedAlterID    uint32
 
@@ -235,9 +236,30 @@ func (s *sspanelSync) emailForUser(userID int64) string {
 
 func (s *sspanelSync) syncUsers(ctx context.Context) error {
 	alterID := s.alterID.Load()
-	snapshot := s.manager.snapshot.Load()
-	if snapshot == nil {
-		return newError("shared sspanel user snapshot unavailable")
+	if reason, divergent := s.manager.divergenceForNode(s.config.NodeID); divergent {
+		s.usersMu.RLock()
+		current := make(map[string]*sspanelUser, len(s.users))
+		for email, user := range s.users {
+			current[email] = user
+		}
+		s.usersMu.RUnlock()
+		for email := range current {
+			if err := s.handler.RemoveUser(ctx, email); err != nil {
+				newError("sspanel: failed to remove user after shared scope divergence").Base(err).AtDebug().WriteToLog()
+			}
+			s.usersMu.Lock()
+			delete(s.users, email)
+			s.usersMu.Unlock()
+		}
+		s.usersMu.Lock()
+		s.appliedGeneration = 0
+		s.appliedAlterID = 0
+		s.usersMu.Unlock()
+		return newError("sspanel: shared user snapshot isolated for node ", s.config.NodeID).Base(errors.New(reason))
+	}
+	snapshot, err := s.manager.snapshotForNode(s.config.NodeID)
+	if err != nil {
+		return err
 	}
 
 	s.usersMu.RLock()
@@ -458,4 +480,3 @@ func remoteIP(address net.Addr) string {
 	}
 	return parsed.String()
 }
-

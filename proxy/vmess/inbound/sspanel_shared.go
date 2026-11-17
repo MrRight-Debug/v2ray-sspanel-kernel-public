@@ -24,6 +24,7 @@ import (
 const (
 	defaultSharedUsersRefresh = 60
 	maxSharedUsersBackoff     = 5 * time.Minute
+	sharedManagerStartupDelay = 100 * time.Millisecond
 )
 
 type sharedSSPanelUser struct {
@@ -36,9 +37,16 @@ type sharedSSPanelSnapshot struct {
 	Users      []sharedSSPanelUser
 	ByID       map[int64]*sharedSSPanelUser
 	Hash       [32]byte
+	RawHash    [32]byte
 	Generation uint64
 	FetchedAt  time.Time
 	SourceNode int64
+}
+
+type sharedSSPanelNodeCache struct {
+	ETag         string
+	LastModified string
+	RawHash      [32]byte
 }
 
 type sharedSSPanelAccount struct {
@@ -55,9 +63,8 @@ type sharedSSPanelManager struct {
 	refs        int
 	nodes       map[int64]int
 	sourceIndex int
-	etag        string
-	lastModify  string
-	etagSource  int64
+	nodeCache   map[int64]sharedSSPanelNodeCache
+	divergent   map[int64]string
 	generation  uint64
 	cancel      context.CancelFunc
 	runDone     chan struct{}
@@ -111,8 +118,10 @@ func sharedManagerFor(config *SSPanelConfig) *sharedSSPanelManager {
 			Transport: transport,
 			Timeout:   30 * time.Second,
 		},
-		nodes: make(map[int64]int),
-		ready: make(chan struct{}),
+		nodes:     make(map[int64]int),
+		nodeCache: make(map[int64]sharedSSPanelNodeCache),
+		divergent: make(map[int64]string),
+		ready:     make(chan struct{}),
 	}
 	sharedSSPanelManagers.managers[identity] = manager
 	return manager
@@ -190,13 +199,22 @@ func (m *sharedSSPanelManager) refreshInterval() time.Duration {
 
 func (m *sharedSSPanelManager) run(ctx context.Context) {
 	failures := 0
+	startup := time.NewTimer(sharedManagerStartupDelay)
+	select {
+	case <-ctx.Done():
+		startup.Stop()
+		return
+	case <-startup.C:
+	}
 	for {
-		err := m.fetchUserSnapshot(ctx)
+		successes, err := m.refreshUserSnapshots(ctx)
 		m.markReady()
 		delay := m.refreshInterval()
 		if err != nil {
-			failures++
 			newError("sspanel: shared user sync failed").Base(err).AtWarning().WriteToLog()
+		}
+		if successes == 0 {
+			failures++
 			delay = m.refreshInterval() * time.Duration(1<<minInt(failures, 4))
 			if delay > maxSharedUsersBackoff {
 				delay = maxSharedUsersBackoff
@@ -221,7 +239,7 @@ func minInt(left, right int) int {
 	return right
 }
 
-func (m *sharedSSPanelManager) sourceNode() int64 {
+func (m *sharedSSPanelManager) orderedNodes() ([]int64, int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	nodes := make([]int64, 0, len(m.nodes))
@@ -232,11 +250,15 @@ func (m *sharedSSPanelManager) sourceNode() int64 {
 		nodes = append(nodes, nodeID)
 	}
 	if len(nodes) == 0 {
-		return 0
+		return nil, 0
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i] < nodes[j] })
-	nodeID := nodes[m.sourceIndex%len(nodes)]
-	return nodeID
+	index := m.sourceIndex % len(nodes)
+	source := nodes[index]
+	ordered := make([]int64, 0, len(nodes))
+	ordered = append(ordered, nodes[index:]...)
+	ordered = append(ordered, nodes[:index]...)
+	return ordered, source
 }
 
 func (m *sharedSSPanelManager) requestJSON(
@@ -310,52 +332,14 @@ func (m *sharedSSPanelManager) requestJSON(
 	return meta, nil
 }
 
-func (m *sharedSSPanelManager) fetchUserSnapshot(ctx context.Context) error {
-	source := m.sourceNode()
-	if source == 0 {
-		return newError("no active shared user source")
-	}
-	m.mu.Lock()
-	etag := m.etag
-	lastModified := m.lastModify
-	if m.etagSource != source {
-		etag = ""
-		lastModified = ""
-	}
-	m.mu.Unlock()
-
-	headers := make(http.Header)
-	if etag != "" {
-		headers.Set("If-None-Match", etag)
-	}
-	if lastModified != "" {
-		headers.Set("If-Modified-Since", lastModified)
-	}
+func decodeSharedUsers(payload []byte) ([]sharedSSPanelUser, map[int64]*sharedSSPanelUser, [32]byte, error) {
 	response := new(sspanelUsersResponse)
-	query := url.Values{"node_id": []string{strconv.FormatInt(source, 10)}}
-	meta, err := m.requestJSON(ctx, http.MethodGet, "users", query, nil, response, headers)
-	if err != nil {
-		m.mu.Lock()
-		m.sourceIndex++
-		m.etag = ""
-		m.lastModify = ""
-		m.etagSource = 0
-		m.mu.Unlock()
-		return err
-	}
-	if meta.NotModified {
-		return nil
+	if err := json.Unmarshal(payload, response); err != nil {
+		return nil, nil, [32]byte{}, err
 	}
 	if response.Ret != 1 {
-		m.mu.Lock()
-		m.sourceIndex++
-		m.etag = ""
-		m.lastModify = ""
-		m.etagSource = 0
-		m.mu.Unlock()
-		return newError("sspanel rejected shared user list request")
+		return nil, nil, [32]byte{}, newError("sspanel rejected shared user list request")
 	}
-
 	byID := make(map[int64]sharedSSPanelUser, len(response.Data))
 	for _, item := range response.Data {
 		if item.ID <= 0 || item.UUID == "" {
@@ -373,37 +357,244 @@ func (m *sharedSSPanelManager) fetchUserSnapshot(ctx context.Context) error {
 	}
 	sort.Slice(users, func(i, j int) bool { return users[i].ID < users[j].ID })
 	hash := hashSharedUsers(users)
-	current := m.snapshot.Load()
-	if current != nil && current.Hash == hash {
-		m.mu.Lock()
-		m.etag = meta.ETag
-		m.lastModify = meta.LastModified
-		m.etagSource = source
-		m.mu.Unlock()
-		return nil
-	}
-
 	userByID := make(map[int64]*sharedSSPanelUser, len(users))
 	for index := range users {
 		userByID[users[index].ID] = &users[index]
 	}
+	return users, userByID, hash, nil
+}
+
+func (m *sharedSSPanelManager) requestUsers(
+	ctx context.Context,
+	nodeID int64,
+	headers http.Header,
+) ([]byte, *sspanelHTTPMeta, error) {
+	requestURL := strings.TrimRight(m.url, "/") + "/mod_mu/users"
+	parsedURL, err := url.Parse(requestURL)
+	if err != nil {
+		return nil, nil, newError("invalid sspanel API URL")
+	}
+	values := parsedURL.Query()
+	values.Set("key", m.key)
+	values.Set("node_id", strconv.FormatInt(nodeID, 10))
+	parsedURL.RawQuery = values.Encode()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), nil)
+	if err != nil {
+		return nil, nil, newError("failed to create sspanel request")
+	}
+	request.Header.Set("User-Agent", "v2ray-sspanel/5.56.0")
+	for name, values := range headers {
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
+	}
+
+	response, err := m.client.Do(request)
+	if err != nil {
+		var urlError *url.Error
+		if errors.As(err, &urlError) {
+			err = urlError.Err
+		}
+		return nil, nil, newError("sspanel API users request failed").Base(err)
+	}
+	defer response.Body.Close()
+
+	meta := &sspanelHTTPMeta{
+		ETag:         response.Header.Get("ETag"),
+		LastModified: response.Header.Get("Last-Modified"),
+	}
+	if response.StatusCode == http.StatusNotModified {
+		meta.NotModified = true
+		return nil, meta, nil
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, nil, newError("sspanel API users returned HTTP ", response.StatusCode)
+	}
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxSSPanelResponseSize+1))
+	if err != nil {
+		return nil, nil, newError("failed to read sspanel users response").Base(err)
+	}
+	if len(payload) > maxSSPanelResponseSize {
+		return nil, nil, newError("sspanel users response exceeds size limit")
+	}
+	return payload, meta, nil
+}
+
+func (m *sharedSSPanelManager) refreshUserSnapshots(ctx context.Context) (int, error) {
+	nodes, source := m.orderedNodes()
+	if source == 0 {
+		return 0, newError("no active shared user source")
+	}
+
+	current := m.snapshot.Load()
+	successes := 0
+	sourceOK := false
+	var sourceRawHash [32]byte
+	var candidate *sharedSSPanelSnapshot
+	var firstErr error
+	checked := make(map[int64]struct{}, len(nodes))
+	divergent := make(map[int64]string)
+
+	for _, nodeID := range nodes {
+		m.mu.Lock()
+		cache := m.nodeCache[nodeID]
+		m.mu.Unlock()
+
+		headers := make(http.Header)
+		if cache.ETag != "" {
+			headers.Set("If-None-Match", cache.ETag)
+		}
+		if cache.LastModified != "" {
+			headers.Set("If-Modified-Since", cache.LastModified)
+		}
+
+		payload, meta, err := m.requestUsers(ctx, nodeID, headers)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = newError("node ", nodeID, ": ").Base(err)
+			}
+			continue
+		}
+
+		successes++
+		checked[nodeID] = struct{}{}
+		cacheUsable := true
+		rawHash := cache.RawHash
+		if meta.NotModified {
+			if rawHash == ([32]byte{}) && current != nil {
+				rawHash = current.RawHash
+			}
+		} else {
+			rawHash = sha256.Sum256(payload)
+		}
+
+		if nodeID == source {
+			if meta.NotModified {
+				if current == nil {
+					if firstErr == nil {
+						firstErr = newError("node ", nodeID, ": received 304 without a shared snapshot")
+					}
+					cacheUsable = false
+				} else {
+					sourceOK = true
+					sourceRawHash = current.RawHash
+				}
+			} else if current == nil || rawHash != current.RawHash {
+				users, byID, hash, decodeErr := decodeSharedUsers(payload)
+				if decodeErr != nil {
+					if firstErr == nil {
+						firstErr = newError("node ", nodeID, ": ").Base(decodeErr)
+					}
+					cacheUsable = false
+				} else {
+					sourceOK = true
+					sourceRawHash = rawHash
+					candidate = &sharedSSPanelSnapshot{
+						Users:      users,
+						ByID:       byID,
+						Hash:       hash,
+						RawHash:    rawHash,
+						FetchedAt:  time.Now(),
+						SourceNode: source,
+					}
+				}
+			} else {
+				sourceOK = true
+				sourceRawHash = rawHash
+			}
+		} else if sourceOK && rawHash != sourceRawHash {
+			divergent[nodeID] = "shared user response differs from source node"
+		}
+
+		if cacheUsable {
+			m.mu.Lock()
+			if !meta.NotModified {
+				cache.ETag = meta.ETag
+				cache.LastModified = meta.LastModified
+			} else {
+				if meta.ETag != "" {
+					cache.ETag = meta.ETag
+				}
+				if meta.LastModified != "" {
+					cache.LastModified = meta.LastModified
+				}
+			}
+			cache.RawHash = rawHash
+			m.nodeCache[nodeID] = cache
+			m.mu.Unlock()
+		}
+	}
+
+	var newlyDivergent []int64
 	m.mu.Lock()
-	m.generation++
-	generation := m.generation
-	m.etag = meta.ETag
-	m.lastModify = meta.LastModified
-	m.etagSource = source
+	for nodeID := range checked {
+		reason, isDivergent := divergent[nodeID]
+		_, wasDivergent := m.divergent[nodeID]
+		switch {
+		case isDivergent:
+			m.divergent[nodeID] = reason
+			if !wasDivergent {
+				newlyDivergent = append(newlyDivergent, nodeID)
+			}
+		case wasDivergent:
+			delete(m.divergent, nodeID)
+		}
+	}
+
+	if candidate != nil {
+		if current == nil || candidate.Hash != current.Hash {
+			m.generation++
+			candidate.Generation = m.generation
+		} else {
+			candidate.Generation = current.Generation
+			candidate.Users = current.Users
+			candidate.ByID = current.ByID
+		}
+		m.snapshot.Store(candidate)
+	}
+	if !sourceOK {
+		m.sourceIndex++
+	}
 	m.mu.Unlock()
-	m.snapshot.Store(&sharedSSPanelSnapshot{
-		Users:      users,
-		ByID:       userByID,
-		Hash:       hash,
-		Generation: generation,
-		FetchedAt:  time.Now(),
-		SourceNode: source,
-	})
-	m.pruneAccounts(users)
-	return nil
+
+	for _, nodeID := range newlyDivergent {
+		newError("sspanel: shared user snapshot mismatch for node ", nodeID).AtWarning().WriteToLog()
+	}
+	if candidate != nil {
+		m.pruneAccounts(candidate.Users)
+	}
+	if firstErr != nil {
+		return successes, firstErr
+	}
+	if !sourceOK {
+		return successes, newError("shared source node did not provide a valid snapshot")
+	}
+	return successes, nil
+}
+
+func (m *sharedSSPanelManager) fetchUserSnapshot(ctx context.Context) error {
+	_, err := m.refreshUserSnapshots(ctx)
+	return err
+}
+
+func (m *sharedSSPanelManager) snapshotForNode(nodeID int64) (*sharedSSPanelSnapshot, error) {
+	reason, divergent := m.divergenceForNode(nodeID)
+	if divergent {
+		return nil, newError("sspanel: shared user snapshot isolated for node ", nodeID).Base(errors.New(reason))
+	}
+	snapshot := m.snapshot.Load()
+	if snapshot == nil {
+		return nil, newError("shared sspanel user snapshot unavailable")
+	}
+	return snapshot, nil
+}
+
+func (m *sharedSSPanelManager) divergenceForNode(nodeID int64) (string, bool) {
+	m.mu.Lock()
+	reason, divergent := m.divergent[nodeID]
+	m.mu.Unlock()
+	return reason, divergent
 }
 
 func hashSharedUsers(users []sharedSSPanelUser) [32]byte {
