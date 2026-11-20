@@ -1,0 +1,18 @@
+[Unit]
+Description=V2Ray SSPanel VMess service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/v2ray-sspanel/config.env
+ExecStart=/opt/v2ray-sspanel/v2ray-sspanel run -config /etc/v2ray-sspanel/server.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+MemoryAccounting=yes
+TasksAccounting=yes
+
+[Install]
+WantedBy=multi-user.target
+

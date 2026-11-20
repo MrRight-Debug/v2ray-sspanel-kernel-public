@@ -1,0 +1,71 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "node-a",
+      "listen": "0.0.0.0",
+      "port": 10086,
+      "protocol": "vmess",
+      "settings": {
+        "sspanel": {
+          "url": "https://panel.example.invalid",
+          "key": "REPLACE_WITH_PANEL_KEY",
+          "node_id": "NODE_ID_A",
+          "refresh": 60,
+          "conn_limit": 0
+        }
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/REPLACE_WITH_WS_PATH"
+        }
+      }
+    },
+    {
+      "tag": "node-b",
+      "listen": "::",
+      "port": 10087,
+      "protocol": "vmess",
+      "settings": {
+        "sspanel": {
+          "url": "https://panel.example.invalid",
+          "key": "REPLACE_WITH_PANEL_KEY",
+          "node_id": "NODE_ID_B",
+          "refresh": 60,
+          "conn_limit": 0
+        }
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/REPLACE_WITH_WS_PATH"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ],
+  "stats": {},
+  "policy": {
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    },
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    }
+  }
+}
+

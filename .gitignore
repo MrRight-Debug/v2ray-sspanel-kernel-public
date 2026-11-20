@@ -1,0 +1,9 @@
+server.json
+config.env
+*.key
+*.pem
+*.log
+*.pid
+__pycache__/
+*.pyc
+

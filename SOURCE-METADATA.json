@@ -1,0 +1,36 @@
+{
+  "project": "V2Ray SSPanel kernel engineering record",
+  "upstream": {
+    "name": "V2Fly V2Ray Core",
+    "tag": "v5.56.0",
+    "commit": "99957b4dcc9e3b40d387ba1584a17cebc5238d9f"
+  },
+  "implementation": {
+    "branch": "codex/sspanel-v5.56.0-shared-auth-sec",
+    "commit": "b6933905fd27d07ac8cddb53e4a22f0b3303d37e",
+    "reachable_commits": 6971,
+    "go": "go1.27.4 linux/amd64",
+    "linkage": "static",
+    "entrypoint": "./main/slim"
+  },
+  "source_bundle": {
+    "sha256": "bd43f466808344e0f6d8de04b348ff086228c855e40d6b02344e499d6909adee",
+    "size_bytes": 71019362
+  },
+  "artifact": {
+    "name": "v2ray-sspanel",
+    "size_bytes": 26480764,
+    "sha256": "3d0e6b54b8d6480ccf8e38666202356da05fbea12d0fde30e529fa1478d737a0"
+  },
+  "old_production_baseline": {
+    "version": "V2Ray 5.53",
+    "sha256": "6ece64c88e2208905e88dab4d65d0a6c4a92a273decbc9b00bf0cc7cfb2cfeee"
+  },
+  "dependency_updates": {
+    "golang.org/x/crypto": ["v0.58.0", "v0.59.0"],
+    "golang.org/x/sync": ["v0.24.0", "v0.25.0"],
+    "golang.org/x/sys": ["v0.49.0", "v0.50.0"],
+    "golang.org/x/text": ["v0.43.0", "v0.44.0"]
+  }
+}
+
